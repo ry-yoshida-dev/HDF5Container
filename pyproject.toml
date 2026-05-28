@@ -22,8 +22,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/ry-yoshida-private/HDF5Container"
-"Bug Tracker" = "https://github.com/ry-yoshida-private/HDF5Container/issues"
+Homepage = "https://github.com/ry-yoshida-dev/HDF5Container"
+"Bug Tracker" = "https://github.com/ry-yoshida-dev/HDF5Container/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
