@@ -30,3 +30,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 hdf5_container = ["py.typed"]
+
+[tool.pyright]
+typeCheckingMode = "standard"
+reportMissingTypeStubs = false

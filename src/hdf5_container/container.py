@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+import threading
 import h5py
 import numpy as np
 from typing import Any, Iterator
@@ -14,20 +15,27 @@ logger = logging.getLogger(__name__)
 @dataclass
 class HDF5Container(IOMixin, SpecialMethodsMixin):
     """Container for HDF5 operations with automatic flushing.
-    
+
     This class provides a convenient interface for storing and retrieving data
-    from HDF5 files with hierarchical group structure support.
-    
+    from HDF5 files with hierarchical group structure support. Thread-safe
+    operations are enforced through a reentrant lock shared across all
+    subcontainers.
+
     Parameters
     ----------
     data : h5py.File | h5py.Group
         The HDF5 file or group to operate on.
     flush_interval : int, optional
         Number of operations before automatic flush, by default 100.
+    counter : FlushCounter, optional
+        Shared flush counter for periodic flushing.
+    lock : threading.RLock, optional
+        Shared reentrant lock for thread-safe access. If None, creates a new lock.
     """
     data: h5py.File | h5py.Group
     flush_interval: int = 100
     counter: FlushCounter = field(default_factory=FlushCounter)
+    lock: threading.RLock = field(default_factory=threading.RLock)
 
     def __post_init__(self) -> None:
         """Validate constructor arguments after dataclass initialization."""
@@ -35,14 +43,14 @@ class HDF5Container(IOMixin, SpecialMethodsMixin):
             raise ValueError("flush_interval must be greater than 0.")
 
     def store(
-        self, 
-        keys: list[str], 
-        name: str, 
+        self,
+        keys: list[str],
+        name: str,
         data: Any,
-        is_dtype_change_enabled: bool = False
-        ) -> None:
+        is_dtype_change_enabled: bool = False,
+    ) -> None:
         """Store a value in the HDF5 file at the specified location.
-        
+
         Parameters
         ----------
         keys : list[str]
@@ -53,23 +61,28 @@ class HDF5Container(IOMixin, SpecialMethodsMixin):
             Data to store in the dataset.
         is_dtype_change_enabled : bool, optional
             Whether to allow dtype changes when overwriting, by default False.
+
+        Notes
+        -----
+        This method is thread-safe via internal locking.
         """
-        subgroup = self.access_subgroup(keys=keys)
-        subgroup.set_data(
-            name=name, 
-            data=data,
-            is_dtype_change_enabled=is_dtype_change_enabled
+        with self.lock:
+            subgroup = self.access_subgroup(keys=keys)
+            subgroup.set_data(
+                name=name,
+                data=data,
+                is_dtype_change_enabled=is_dtype_change_enabled,
             )
-        subgroup.process_flush()
+            subgroup.process_flush()
 
     def set_data(
-        self, 
-        name: str, 
+        self,
+        name: str,
         data: Any,
-        is_dtype_change_enabled: bool = False
-        ) -> None:
+        is_dtype_change_enabled: bool = False,
+    ) -> None:
         """Set data in the specified HDF5 group.
-        
+
         Parameters
         ----------
         name : str
@@ -78,35 +91,40 @@ class HDF5Container(IOMixin, SpecialMethodsMixin):
             Data to store.
         is_dtype_change_enabled : bool, optional
             Whether to allow dtype changes when overwriting, by default False.
+
+        Notes
+        -----
+        This method is thread-safe via internal locking.
         """
-        if type(data) != np.ndarray:
-            data = np.array(data)
+        with self.lock:
+            if type(data) != np.ndarray:
+                data = np.array(data)
 
-        if np.issubdtype(data.dtype, np.str_):
-            data = data.astype('S')
+            if np.issubdtype(data.dtype, np.str_):
+                data = data.astype('S')
 
-        if name not in self.data.keys():
-            self.data.create_dataset(
-            name=name, 
-            dtype=data.dtype,
-            data=data
-            )
-            return
+            if name not in self.data.keys():
+                self.data.create_dataset(
+                    name=name,
+                    dtype=data.dtype,
+                    data=data,
+                )
+                return
 
-        self._replace_data(
-            data=data,
-            name=name,
-            is_dtype_change_enabled=is_dtype_change_enabled
+            self._replace_data(
+                data=data,
+                name=name,
+                is_dtype_change_enabled=is_dtype_change_enabled,
             )
 
     def _replace_data(
         self,
         data: np.ndarray,
         name: str,
-        is_dtype_change_enabled: bool = False
-        ) -> None:
+        is_dtype_change_enabled: bool = False,
+    ) -> None:
         """Replace an existing dataset value in the current group.
-        
+
         Parameters
         ----------
         data : np.ndarray
@@ -122,130 +140,165 @@ class HDF5Container(IOMixin, SpecialMethodsMixin):
             If the target key does not resolve to a dataset.
         TypeError
             If dtype differs and dtype change is not enabled.
+
+        Notes
+        -----
+        This method is thread-safe via internal locking. Can be called from
+        locked or unlocked contexts due to RLock usage.
         """
-        past_data = self.data[name]
-        if not isinstance(past_data, h5py.Dataset):
-            raise ValueError(f"Dataset {name} is not a dataset.")
-        past_value = np.array(past_data[()])
+        with self.lock:
+            past_data = self.data[name]
+            if not isinstance(past_data, h5py.Dataset):
+                raise ValueError(f"Dataset {name} is not a dataset.")
+            past_value = np.array(past_data[()])
 
-        is_same_type = data.dtype == past_value.dtype
-        is_same_shape = data.shape == past_value.shape
+            is_same_type = data.dtype == past_value.dtype
+            is_same_shape = data.shape == past_value.shape
 
-        if is_same_type and is_same_shape:
-            past_data[()] = data
-            return
- 
-        if not is_dtype_change_enabled and not is_same_type:
-            logger.debug("dtype mismatch in group %s", self.data)
-            raise TypeError(
-                f"Cannot overwrite data with different dtype.\n"
-                f"Existing: {past_value.dtype}, New: {data.dtype}"
-            )
+            if is_same_type and is_same_shape:
+                past_data[()] = data
+                return
 
-        del self.data[name]
-        self.data.create_dataset(
-            name=name, 
-            dtype=data.dtype,
-            data=data
+            if not is_dtype_change_enabled and not is_same_type:
+                logger.debug("dtype mismatch in group %s", self.data)
+                raise TypeError(
+                    f"Cannot overwrite data with different dtype.\n"
+                    + f"Existing: {past_value.dtype}, New: {data.dtype}"
+                )
+
+            del self.data[name]
+            self.data.create_dataset(
+                name=name,
+                dtype=data.dtype,
+                data=data,
             )
         
     def access_value(
-        self, 
-        keys: list[str], 
-        name: str
-        ) -> Any:
+        self,
+        keys: list[str],
+        name: str,
+    ) -> Any:
         """Retrieve a value from the HDF5 file at the specified location.
-        
+
         Parameters
         ----------
         keys : list[str]
             List of group keys to navigate to the target subgroup.
         name : str
             Name of the dataset to retrieve.
-        
+
         Returns
         -------
         Any
             The value stored in the dataset, or None if not found.
+
+        Notes
+        -----
+        This method is thread-safe via internal locking.
         """
-        subgroup = self.access_subgroup(keys=keys)
-        return subgroup.get(name=name)
+        with self.lock:
+            subgroup = self.access_subgroup(keys=keys)
+            return subgroup.get(name=name)
 
     def access_subgroup(
-        self, 
-        keys: list[str]
-        ) -> HDF5Container:
+        self,
+        keys: list[str],
+    ) -> HDF5Container:
         """Access or create a subgroup using the provided key path.
-        
+
         Parameters
         ----------
         keys : list[str]
             List of group keys to navigate/create the subgroup.
-        
+
         Returns
         -------
         HDF5Container
             The HDF5Container object containing the target subgroup.
+
+        Notes
+        -----
+        This method is thread-safe via internal locking. The returned
+        container shares the parent's lock for coordinated multi-threaded access.
         """
-        subgroup = self.data
-        for key in keys:            
-            subgroup = subgroup.require_group(key) 
-        return self.__class__(
-            data=subgroup, 
-            flush_interval=self.flush_interval, 
-            counter=self.counter
+        with self.lock:
+            subgroup = self.data
+            for key in keys:
+                subgroup = subgroup.require_group(key)
+            return self.__class__(
+                data=subgroup,
+                flush_interval=self.flush_interval,
+                counter=self.counter,
+                lock=self.lock,
             )
 
     def get(
-        self, 
-        name: str
-        ) -> Any:
+        self,
+        name: str,
+    ) -> Any:
         """Retrieve a value from the specified HDF5 group.
-        
+
         Parameters
         ----------
         name : str
             Name of the dataset.
-        
+
         Returns
         -------
         Any
             The dataset value if found, None otherwise.
+
+        Notes
+        -----
+        This method is thread-safe via internal locking.
         """
-        value = self.data.get(name, None)
-        if isinstance(value, h5py.Dataset):
-            output: Any = value[()]
-            if isinstance(output, bytes):
-                output = output.decode('utf-8')
-            return output
-        return value
+        with self.lock:
+            value = self.data.get(name, None)
+            if isinstance(value, h5py.Dataset):
+                output: Any = value[()]
+                if isinstance(output, bytes):
+                    output = output.decode('utf-8')
+                return output
+            return value
 
     def process_flush(self) -> None:
         """Flush periodically based on operation count.
-        
+
         This increments the write counter and flushes when the configured
         flush_interval boundary is reached.
-        
+
         Notes
         -----
         This method is typically called internally after each write operation.
+        This method is thread-safe via internal locking.
         """
-        self.counter.increment()
-        if self.counter.is_flush_timing(flush_interval=self.flush_interval):
-            self.flush()
+        with self.lock:
+            self.counter.increment()
+            if self.counter.is_flush_timing(flush_interval=self.flush_interval):
+                self.flush()
 
     def items(self) -> Iterator[tuple[str, Any]]:
         """Iterate over key-value pairs in the current group.
 
         Group values are wrapped as HDF5Container objects and dataset values
         are returned as decoded Python objects.
+
+        Notes
+        -----
+        This method is thread-safe via snapshot isolation. It takes a snapshot
+        of the group structure within a lock, then yields items without holding
+        the lock to prevent long-duration blocking of other threads.
         """
-        for key, value in self.data.items():
+        with self.lock:
+            items_snapshot = list(self.data.items())
+
+        for key, value in items_snapshot:
             if isinstance(value, h5py.Group):
                 container = self.__class__(
                     data=value,
                     flush_interval=self.flush_interval,
-                    counter=self.counter
+                    counter=self.counter,
+                    lock=self.lock,
                 )
                 yield key, container
             elif isinstance(value, h5py.Dataset):
@@ -263,13 +316,23 @@ class HDF5Container(IOMixin, SpecialMethodsMixin):
         -------
         Iterator[Any]
             Iterator of group wrappers or decoded dataset values.
+
+        Notes
+        -----
+        This method is thread-safe via snapshot isolation. It takes a snapshot
+        of the group structure within a lock, then yields items without holding
+        the lock to prevent long-duration blocking of other threads.
         """
-        for value in self.data.values():
+        with self.lock:
+            values_snapshot = list(self.data.values())
+
+        for value in values_snapshot:
             if isinstance(value, h5py.Group):
                 container = self.__class__(
                     data=value,
                     flush_interval=self.flush_interval,
-                    counter=self.counter
+                    counter=self.counter,
+                    lock=self.lock,
                 )
                 yield container
             elif isinstance(value, h5py.Dataset):
@@ -283,12 +346,18 @@ class HDF5Container(IOMixin, SpecialMethodsMixin):
                 yield value
 
     def keys(self) -> Iterator[str]:
-        """
-        Iterate over keys in the current group.
+        """Iterate over keys in the current group.
 
         Returns
         -------
         Iterator[str]
             Key iterator for datasets/groups under the current node.
+
+        Notes
+        -----
+        This method is thread-safe via snapshot isolation. It takes a snapshot
+        of keys within a lock, then returns an iterator over the snapshot.
         """
-        return iter(self.data.keys())
+        with self.lock:
+            keys_snapshot: list[str] = list(self.data.keys())
+        return iter(keys_snapshot)

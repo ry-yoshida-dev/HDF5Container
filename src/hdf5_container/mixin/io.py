@@ -37,7 +37,7 @@ class IOMixin:
         data = h5py.File(path, "a")
         if not is_exist_file:
             data.flush()
-        return cls(
+        return cls(  # type: ignore[call-arg]
             data=data,
             flush_interval=flush_interval,
         )
@@ -48,11 +48,13 @@ class IOMixin:
         Notes
         -----
         If the container wraps a group, the parent file is flushed.
+        This method is thread-safe via internal locking.
         """
-        if isinstance(self.data, h5py.File):
-            self.data.flush()
-        else:
-            self.data.file.flush()
+        with self.lock:
+            if isinstance(self.data, h5py.File):
+                self.data.flush()
+            else:
+                self.data.file.flush()
 
     def close(self: HDF5ContainerProtocol) -> None:
         """Flush pending updates and close the underlying HDF5 file.
@@ -60,9 +62,14 @@ class IOMixin:
         Notes
         -----
         This method is safe for both file-backed and group-backed containers.
+        This method is thread-safe via internal locking.
         """
-        self.flush()
-        if isinstance(self.data, h5py.File):
-            self.data.close()
-        else:
-            self.data.file.close()
+        with self.lock:
+            if isinstance(self.data, h5py.File):
+                self.data.flush()
+            else:
+                self.data.file.flush()
+            if isinstance(self.data, h5py.File):
+                self.data.close()
+            else:
+                self.data.file.close()

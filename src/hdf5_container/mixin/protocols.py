@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from typing import Any, Protocol
 
 import h5py
@@ -15,12 +16,14 @@ class HDF5ContainerProtocol(Protocol):
     data: h5py.File | h5py.Group
     flush_interval: int
     counter: Any
+    lock: threading.RLock
 
     def __init__(
         self,
         data: h5py.File | h5py.Group,
         flush_interval: int = 100,
-        counter: Any = 0,
+        counter: Any = ...,
+        lock: threading.RLock = ...,
     ) -> None:
         """Construct a compatible container instance."""
 
