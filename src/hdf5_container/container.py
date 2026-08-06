@@ -150,10 +150,9 @@ class HDF5Container(IOMixin, SpecialMethodsMixin):
             past_data = self.data[name]
             if not isinstance(past_data, h5py.Dataset):
                 raise ValueError(f"Dataset {name} is not a dataset.")
-            past_value = np.array(past_data[()])
 
-            is_same_type = data.dtype == past_value.dtype
-            is_same_shape = data.shape == past_value.shape
+            is_same_type = data.dtype == past_data.dtype
+            is_same_shape = data.shape == past_data.shape
 
             if is_same_type and is_same_shape:
                 past_data[()] = data
@@ -163,7 +162,7 @@ class HDF5Container(IOMixin, SpecialMethodsMixin):
                 logger.debug("dtype mismatch in group %s", self.data)
                 raise TypeError(
                     f"Cannot overwrite data with different dtype.\n"
-                    + f"Existing: {past_value.dtype}, New: {data.dtype}"
+                    + f"Existing: {past_data.dtype}, New: {data.dtype}"
                 )
 
             del self.data[name]
