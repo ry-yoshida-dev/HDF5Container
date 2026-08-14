@@ -7,6 +7,7 @@ from typing import Any, Iterator
 from dataclasses import dataclass, field
 
 from .mixin import IOMixin, SpecialMethodsMixin
+from .options import HDF5AccessMode, HDF5FileOptions
 from .utils.counter import FlushCounter
 
 logger = logging.getLogger(__name__)
@@ -31,11 +32,28 @@ class HDF5Container(IOMixin, SpecialMethodsMixin):
         Shared flush counter for periodic flushing.
     lock : threading.RLock, optional
         Shared reentrant lock for thread-safe access. If None, creates a new lock.
+    path : str | None, optional
+        Filesystem path this container was opened from via
+        :meth:`from_path`, by default None. ``None`` for containers built
+        directly from an ``h5py.File``/``h5py.Group`` without going
+        through :meth:`from_path`.
+    access_mode : HDF5AccessMode | None, optional
+        Access mode the underlying file was opened with, by default None.
+        ``None`` means no read-only enforcement is applied.
+    file_options : HDF5FileOptions, optional
+        Tuning options the underlying file was created/opened with.
+    is_page_buffering_enabled : bool, optional
+        Whether the underlying file uses paged allocation, by default
+        False.
     """
     data: h5py.File | h5py.Group
     flush_interval: int = 100
     counter: FlushCounter = field(default_factory=FlushCounter)
     lock: threading.RLock = field(default_factory=threading.RLock)
+    path: str | None = None
+    access_mode: HDF5AccessMode | None = None
+    file_options: HDF5FileOptions = field(default_factory=HDF5FileOptions)
+    is_page_buffering_enabled: bool = False
 
     def __post_init__(self) -> None:
         """Validate constructor arguments after dataclass initialization."""
@@ -171,7 +189,7 @@ class HDF5Container(IOMixin, SpecialMethodsMixin):
                 dtype=data.dtype,
                 data=data,
             )
-        
+
     def access_value(
         self,
         keys: list[str],
@@ -205,6 +223,10 @@ class HDF5Container(IOMixin, SpecialMethodsMixin):
     ) -> HDF5Container:
         """Access or create a subgroup using the provided key path.
 
+        On a read-only container, navigating to an already-existing group
+        is permitted and never creates anything; only a missing key raises,
+        since creating it would require write access.
+
         Parameters
         ----------
         keys : list[str]
@@ -215,21 +237,89 @@ class HDF5Container(IOMixin, SpecialMethodsMixin):
         HDF5Container
             The HDF5Container object containing the target subgroup.
 
+        Raises
+        ------
+        PermissionError
+            If this container's access mode is read-only and one of
+            ``keys`` does not resolve to an existing group, so creating it
+            would be required. Use :meth:`open_subgroup` to probe for a
+            subgroup's existence without raising.
+
         Notes
         -----
         This method is thread-safe via internal locking. The returned
         container shares the parent's lock for coordinated multi-threaded access.
         """
         with self.lock:
+            is_read_only = self.access_mode is not None and not self.access_mode.is_writable
             subgroup = self.data
             for key in keys:
-                subgroup = subgroup.require_group(key)
-            return self.__class__(
-                data=subgroup,
-                flush_interval=self.flush_interval,
-                counter=self.counter,
-                lock=self.lock,
-            )
+                if is_read_only:
+                    child = subgroup.get(key)
+                    if not isinstance(child, h5py.Group):
+                        raise PermissionError(
+                            f"Cannot create group {key!r} on a read-only container; "
+                            + "use open_subgroup to probe for it instead."
+                        )
+                    subgroup = child
+                else:
+                    subgroup = subgroup.require_group(key)
+            return self._wrap(data=subgroup)
+
+    def open_subgroup(self, keys: list[str]) -> HDF5Container | None:
+        """Resolve an existing subgroup without creating anything.
+
+        Parameters
+        ----------
+        keys : list[str]
+            List of group keys to navigate to the target subgroup.
+
+        Returns
+        -------
+        HDF5Container | None
+            The container wrapping the resolved subgroup, or ``None``
+            when any key in ``keys`` is missing or resolves to a dataset
+            rather than a group.
+
+        Notes
+        -----
+        This method is thread-safe via internal locking. Unlike
+        :meth:`access_subgroup`, it never creates a group and is
+        permitted on a read-only container.
+        """
+        with self.lock:
+            node: h5py.File | h5py.Group = self.data
+            for key in keys:
+                child = node.get(key)
+                if not isinstance(child, h5py.Group):
+                    return None
+                node = child
+            return self._wrap(data=node)
+
+    def _wrap(self, data: h5py.File | h5py.Group) -> HDF5Container:
+        """Wrap a group or file node, propagating this container's shared state.
+
+        Parameters
+        ----------
+        data : h5py.File | h5py.Group
+            Node to wrap.
+
+        Returns
+        -------
+        HDF5Container
+            A new container sharing this container's counter, lock and
+            file-level metadata.
+        """
+        return self.__class__(
+            data=data,
+            flush_interval=self.flush_interval,
+            counter=self.counter,
+            lock=self.lock,
+            path=self.path,
+            access_mode=self.access_mode,
+            file_options=self.file_options,
+            is_page_buffering_enabled=self.is_page_buffering_enabled,
+        )
 
     def get(
         self,
@@ -293,13 +383,7 @@ class HDF5Container(IOMixin, SpecialMethodsMixin):
 
         for key, value in items_snapshot:
             if isinstance(value, h5py.Group):
-                container = self.__class__(
-                    data=value,
-                    flush_interval=self.flush_interval,
-                    counter=self.counter,
-                    lock=self.lock,
-                )
-                yield key, container
+                yield key, self._wrap(data=value)
             elif isinstance(value, h5py.Dataset):
                 yield key, self.get(name=key)
             else:
@@ -327,13 +411,7 @@ class HDF5Container(IOMixin, SpecialMethodsMixin):
 
         for value in values_snapshot:
             if isinstance(value, h5py.Group):
-                container = self.__class__(
-                    data=value,
-                    flush_interval=self.flush_interval,
-                    counter=self.counter,
-                    lock=self.lock,
-                )
-                yield container
+                yield self._wrap(data=value)
             elif isinstance(value, h5py.Dataset):
                 output = value[()]
                 if isinstance(output, bytes):

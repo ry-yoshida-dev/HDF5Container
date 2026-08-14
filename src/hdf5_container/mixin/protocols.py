@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import threading
-from typing import Any, Protocol
+from typing import Protocol
 
 import h5py
+
+from ..options import HDF5AccessMode, HDF5FileOptions
+from ..utils.counter import FlushCounter
 
 
 class HDF5ContainerProtocol(Protocol):
@@ -15,15 +18,23 @@ class HDF5ContainerProtocol(Protocol):
 
     data: h5py.File | h5py.Group
     flush_interval: int
-    counter: Any
+    counter: FlushCounter
     lock: threading.RLock
+    path: str | None
+    access_mode: HDF5AccessMode | None
+    file_options: HDF5FileOptions
+    is_page_buffering_enabled: bool
 
     def __init__(
         self,
         data: h5py.File | h5py.Group,
         flush_interval: int = 100,
-        counter: Any = ...,
+        counter: FlushCounter = ...,
         lock: threading.RLock = ...,
+        path: str | None = None,
+        access_mode: HDF5AccessMode | None = None,
+        file_options: HDF5FileOptions = ...,
+        is_page_buffering_enabled: bool = False,
     ) -> None:
         """Construct a compatible container instance."""
 
