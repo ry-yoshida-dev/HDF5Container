@@ -10,7 +10,7 @@ from .column_spec import ColumnSpec
 from .growable_column import GrowableColumn
 
 _ROW_COUNT_ATTRIBUTE = "row_count"
-_DEFAULT_GROWTH_QUANTUM = 8192
+_DEFAULT_GROWTH_QUANTUM = 81920
 
 
 class ColumnTable:
@@ -54,7 +54,7 @@ class ColumnTable:
             Specification of every column in the table.
         growth_quantum : int, optional
             Row-count granularity new capacity is reserved in, by default
-            8192.
+            81920.
 
         Returns
         -------
