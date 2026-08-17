@@ -6,6 +6,8 @@ import numpy as np
 from typing import Any, Iterator
 from dataclasses import dataclass, field
 
+from numpy.typing import NDArray
+
 from .mixin import IOMixin, SpecialMethodsMixin
 from .options import HDF5AccessMode, HDF5FileOptions
 from .utils.counter import FlushCounter
@@ -254,17 +256,45 @@ class HDF5Container(IOMixin, SpecialMethodsMixin):
             is_read_only = self.access_mode is not None and not self.access_mode.is_writable
             subgroup = self.data
             for key in keys:
-                if is_read_only:
-                    child = subgroup.get(key)
-                    if not isinstance(child, h5py.Group):
-                        raise PermissionError(
-                            f"Cannot create group {key!r} on a read-only container; "
-                            + "use open_subgroup to probe for it instead."
-                        )
-                    subgroup = child
-                else:
-                    subgroup = subgroup.require_group(key)
+                subgroup = self._resolve_or_require_child_group(
+                    group=subgroup, key=key, is_read_only=is_read_only
+                )
             return self._wrap(data=subgroup)
+
+    def _resolve_or_require_child_group(
+        self, group: h5py.Group, key: str, *, is_read_only: bool
+    ) -> h5py.Group:
+        """Resolve an existing child group, or create it when writable.
+
+        Parameters
+        ----------
+        group : h5py.Group
+            The parent group to navigate from.
+        key : str
+            Name of the child group to resolve or create.
+        is_read_only : bool
+            Whether the container is read-only.
+
+        Returns
+        -------
+        h5py.Group
+            The resolved or newly created child group.
+
+        Raises
+        ------
+        PermissionError
+            If ``is_read_only`` is ``True`` and ``key`` does not resolve to
+            an existing group, so creating it would be required.
+        """
+        if not is_read_only:
+            return group.require_group(key)
+        child = group.get(key)
+        if not isinstance(child, h5py.Group):
+            raise PermissionError(
+                f"Cannot create group {key!r} on a read-only container; "
+                + "use open_subgroup to probe for it instead."
+            )
+        return child
 
     def open_subgroup(self, keys: list[str]) -> HDF5Container | None:
         """Resolve an existing subgroup without creating anything.
@@ -344,11 +374,30 @@ class HDF5Container(IOMixin, SpecialMethodsMixin):
         with self.lock:
             value = self.data.get(name, None)
             if isinstance(value, h5py.Dataset):
-                output: Any = value[()]
-                if isinstance(output, bytes):
-                    output = output.decode('utf-8')
-                return output
+                return self._decode_scalar_dataset(value[()])
             return value
+
+    @staticmethod
+    def _decode_scalar_dataset(
+        value: NDArray[np.generic] | np.generic,
+    ) -> str | NDArray[np.generic] | np.generic:
+        """Decode byte strings within a raw dataset value into UTF-8 text.
+
+        Parameters
+        ----------
+        value : NDArray[np.generic] | np.generic
+            Raw value read from an ``h5py.Dataset``.
+
+        Returns
+        -------
+        str | NDArray[np.generic] | np.generic
+            The value with any byte strings decoded to ``str``.
+        """
+        if isinstance(value, bytes):
+            return value.decode('utf-8')
+        if isinstance(value, np.ndarray) and value.dtype.kind == 'S':
+            return np.array([item.decode('utf-8') for item in value.tolist()])
+        return value
 
     def process_flush(self) -> None:
         """Flush periodically based on operation count.
